@@ -31,7 +31,7 @@ REMOTE_PATH = "eqbcs"
 CRED_SERVICE = f"deploy:{SSH_USER}@{SSH_HOST}"
 
 # Upload filters
-SKIP_NAMES = {"README.md"}                # exact filename blocks
+SKIP_NAMES = {"README.md","buildspec.yaml"}                # exact filename blocks
 SKIP_SUFFIXES = {".code-workspace"}       # suffix-based blocks (generalizes pok.code-workspace)
 SKIP_DIRS = {"node_modules", "__pycache__", "dist", "build", "venv", ".venv"}  # pruned during walk
 

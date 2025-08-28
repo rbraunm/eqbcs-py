@@ -1,0 +1,345 @@
+meta:
+  specName: EQBCS Protocol & Server Behavior
+  version: 0.1.3
+  updated: 2025-08-28
+  status: draft
+  owners:
+  - GPT-5 Thinking
+  - Randy B
+  canonicalFileName: eqbcs-spec.yaml
+  notes: 'Language-agnostic, wire-compatible description of the EQBCS server and
+
+    its client interaction model. Designed to be edited like code.
+
+    '
+conventions:
+  casing: drinkingCamelCaseWithABBR
+  tokens:
+    angleSender: '<{charName}> '
+    tellSender: '[{charName}] '
+    bciSender: '{{{charName}}} '
+  whitespaceRules:
+    collapseConsecutiveSpaces: true
+    leadingSpacesAtStartOfLine: disallowed
+  lineEndings:
+    normalMode: '
+
+      '
+    commandMode: '
+
+      '
+    carriageReturnHandling:
+      commandLines: ignore
+      normalLines: preserve
+transport:
+  protocol: TCP
+  listenAddressDefault: 0.0.0.0
+  defaultPort: 2112
+  maxClients: 250
+  backlog: 1
+  socketNotes:
+  - Server uses blocking accept() + select()-style IO internally; implementation detail
+    only.
+authentication:
+  loginToken:
+    startToken: LOGIN=
+    withPasswordPrefix: LOGIN:{password}=
+    terminator: ;
+  acceptedForms:
+  - LOGIN=<CharName>;
+  - LOGIN:<Password>=<CharName>;
+  parsing:
+    charNameMaxLen: 70
+    charNameCaseSensitivity: case-sensitive storage; direct tells use case-insensitive
+      matching; duplicate login detection is case-sensitive
+    requirements:
+    - terminatorSemicolonRequired: true
+    - charNameNonEmpty: true
+  duplicateNamePolicy:
+    action: kickExisting
+    notes: Existing connection with the same charName is closed; its in-memory name
+      may be suffixed with "-old".
+framing:
+  overview: 'There are two input modes: normal text and command mode.
+
+    - Any line that begins with a TAB (\t) enters **command mode** for that line.
+
+    - All other lines are **normal message** lines.
+
+    '
+  normalMessageLines:
+    prefix: '<{sender}> '
+    body: '{text}'
+    suffix: '
+
+      '
+    spaceCollapse: true
+  commandLines:
+    prefix: "\t"
+    token: UPPERCASE_WORD
+    args: optional, separated by a single space (see per-command)
+    terminator: '
+
+      '
+commandsFromClient:
+  NBMSG:
+    kind: armNextLine
+    effect: 'The *next* normal line sent by this client is broadcast to all clients
+
+      as a NetBots packet line. The server prefixes that outbound line with
+
+      "\tNBPKT:{sender}:" (see serverOutputs.NBPKT).
+
+      '
+    nextLineFormatFromClient: '{text}'
+  MSGALL:
+    kind: armNextLine
+    effect: 'The *next* normal line is sent to **all** authorized clients. The wire
+      line
+
+      starts with "<{sender}> ", then a space-separated roster of all online names,
+
+      then the message text, then "\n" (see serverOutputs.MSGALL).
+
+      '
+  TELL:
+    kind: armNextLine
+    nextLineFormatFromClient: <target> <text>
+    targetResolution: &id001
+    - first: case-insensitive match on charName
+    - else: case-sensitive match against channel tokens (see CHANNELS)
+    effect: 'If <target> is a charName, send to that single client using "[{sender}]
+      " prefix.
+
+      Else if <target> matches a channel token, deliver to all clients who have joined
+      that channel.
+
+      If no recipients, the sender receives "-- <target>: No such name.\n".
+
+      '
+    escaping: Backslash (\\) escapes the next character in the message text.
+  BCI:
+    kind: armNextLine
+    nextLineFormatFromClient: <target> <text>
+    targetResolution: *id001
+    effect: 'Same routing semantics as TELL, but the receiver''s line is prefixed
+      with "{{{sender}}} " (curly braces).
+
+      If no recipients, the sender receives "-- <target>: No such name.\n".
+
+      '
+    escaping: Backslash (\\) escapes the next character in the message text.
+  CHANNELS:
+    kind: armNextLine
+    nextLineFormatFromClient: <tokenA> <tokenB> ...
+    effect: 'Replaces this client''s channel token list with the provided space-separated
+      tokens.
+
+      Confirmation is sent back only to the caller: "<name> joined channels <list>.\n".
+
+      '
+  NAMES:
+    kind: immediate
+    effect: Replies to the caller with a single line listing all authorized clients.
+  NBNAMES:
+    kind: immediate
+    effect: 'Replies to the caller with a NetBots-style list of client names (see
+      serverOutputs.NBCLIENTLIST).
+
+      The server also pushes NBCLIENTLIST automatically when the roster changes.
+
+      '
+  DISCONNECT:
+    kind: immediate
+    effect: Server closes this connection.
+  LOCALECHO:
+    kind: immediate
+    syntax: LOCALECHO 0|1
+    effect: 'Toggles server-side console echo of your own actions; replies with "--
+      Local Echo: ON|OFF\n". Also controls whether the sender sees their own message
+      when targeting channel tokens via TELL/BCI: ON includes an echo to the sender;
+      OFF suppresses it.'
+  PONG:
+    kind: immediate
+    effect: Acknowledges a server PING; updates lastPingReponseTimeSecs. No other
+      side effects.
+  unknownCommandBehavior:
+    reply: '-- Unknown Command: <TOKEN>\n'
+serverOutputs:
+  controlLines:
+    PING: "\tPING\n"
+    NBJOIN: "\tNBJOIN=<name>\n"
+    NBQUIT: "\tNBQUIT=<name>\n"
+    NBCLIENTLIST: "\tNBCLIENTLIST=<n1> <n2> ...\n"
+    NBPKT: "\tNBPKT:{sender}:{text}\n"
+  chatLines:
+    MSGALL: "\"<{sender}> \" + \"<n1> <n2> ... \" + \"{text}\" + \"\\n\"\nNotes:\n\
+      \  - The roster appears *before* the message text.\n  - There is **no** \"[*ALL*]\"\
+      \ marker on the wire (that tag is written only to the server's local log).\n"
+    TELL: '"[{sender}] " + "{text}" + "\n" (to the resolved direct recipient).
+
+      '
+    BCI: '"{{{sender}}} " + "{text}" + "\n" (to the resolved recipient set).
+
+      '
+    NAMES: '"-- Names: <n1> <n2> ... .\n" (to the requester only)
+
+      '
+    errorNoSuchName: '"-- <target>: No such name.\n" (to the requester only)
+
+      '
+routingRules:
+  normalLineDefault: broadcastToAll
+  armedBehaviors:
+    NBMSG: broadcastToAllAsNBPKT
+    MSGALL: broadcastToAllWithRoster
+    TELL: sendToOneOrChannel
+    BCI: sendToOneOrChannel
+    CHANNELS: updateChannelListOnly
+  nameMatching:
+    charNames: case-insensitive
+    channelTokens: case-sensitive
+  channelListStorage:
+    representation: space-separated tokens per client
+    emptyAllowed: true
+timers:
+  ping:
+    intervalSeconds: 30
+    wire: serverOutputs.controlLines.PING
+    clientResponse: commandsFromClient.PONG
+    timeoutPolicy: advisoryOnly
+iniAndCli:
+  iniFile:
+    path: ./EQBCS.ini
+    section: Settings
+    keys:
+      Password: string
+      Port: int (1..65535)
+  cli:
+  - flag: -p <port>
+    effect: set listen port
+  - flag: -i <addr>
+    effect: set bind address
+  - flag: -l <file>
+    effect: set logfile path
+  - flag: -s <password>
+    effect: require password; changes accepted login token to "LOGIN:<password>="
+  - flag: -t
+    effect: enable socket trace
+  - flag: -r
+    effect: disable process renaming (Windows only)
+  - flag: -d
+    effect: daemonize (*nix)
+testVectors:
+  login:
+    noPassword:
+      in: 'LOGIN=Pariator;
+
+        '
+      out:
+      - "\tNBJOIN=Pariator\n"
+      - "\tNBCLIENTLIST=Pariator\n"
+    withPassword:
+      serverPassword: hunter2
+      in: 'LOGIN:hunter2=Seravane;
+
+        '
+      out:
+      - "\tNBJOIN=Seravane\n"
+  names:
+    cmd: "\tNAMES\n"
+    out: '-- Names: Pariator Seravane ... .
+
+      '
+  nbmsg:
+    in:
+    - "\tNBMSG\n"
+    - 'Hello netbots!
+
+      '
+    out:
+    - "\tNBPKT:Pariator:Hello netbots!\n"
+  msgall:
+    in:
+    - "\tMSGALL\n"
+    - 'LFM Seb Crypt, /tell me
+
+      '
+    outExample: '<Pariator> Seravane Xyssalith Maricelle Elarion LFM Seb Crypt, /tell
+      me
+
+      '
+  tell:
+    in:
+    - "\tTELL\n"
+    - 'Seravane You good for CC?
+
+      '
+    outAtRecipient: '[Pariator] You good for CC?
+
+      '
+    outIfNoSuchName: '-- Seravane: No such name.
+
+      '
+  bci:
+    in:
+    - "\tBCI\n"
+    - 'healchan /sit
+
+      '
+    outAtRecipients: '{{Pariator}} /sit
+
+      '
+  channels:
+    in:
+    - "\tCHANNELS\n"
+    - 'healchan raidchan
+
+      '
+    outToCaller: 'Pariator joined channels healchan raidchan.
+
+      '
+compatNotes:
+  serverMay:
+  - choose any internal IO model if the wire behavior is preserved
+  - store internal message-type markers (values observed: NORMAL=1, NBMSG=2, MSGALL=3,
+      TELL=4, CHANNELS=5, BCI=6)
+  serverMust:
+  - preserve exact wire text forms described in serverOutputs
+  - honor whitespaceRules and carriageReturnHandling
+  - treat any line beginning with TAB as a command line
+changelog:
+  0.1.2:
+  - type: Fix
+    note: YAML syntax fixes (anchor for targetResolution, structured changelog entries,
+      escaped quotes in LOCALECHO effect).
+  0.1.1:
+  - type: Fix
+    note: LOCALECHO syntax clarified to "LOCALECHO 0|1" (with a space) to match code.
+  - type: Fix
+    note: Carriage return handling clarified — CR is ignored only in command lines;
+      preserved in normal lines.
+  - type: Fix
+    note: 'MSGALL wire format corrected: roster appears before the message and no
+      "[*ALL*]" marker is sent to clients.'
+  - type: Add
+    note: Explicit list of server control lines (PING, NBJOIN, NBQUIT, NBCLIENTLIST,
+      NBPKT).
+  - type: Add
+    note: Clarified name-matching rules and channel token case-sensitivity.
+  0.1.0:
+  - Initial extraction from C/C++ codebase into language-agnostic YAML.
+  - Captures transport, auth, framing, commands, routing, timers, and test vectors.
+  0.1.3:
+  - type: Fix
+    note: backlog set to 1 to match code (listen backlog of 1).
+  - type: Fix
+    note: 'unknownCommand reply has no trailing period; now "-- Unknown Command: <TOKEN>\n".'
+  - type: Add
+    note: Documented TELL/BCI backslash-escape behavior.
+  - type: Clarify
+    note: LOCALECHO also controls whether sender sees their own channel-targeted TELL/BCI
+      echo.
+  - type: Clarify
+    note: Duplicate-login matching is case-sensitive; two names differing only by
+      case are distinct.

@@ -3,7 +3,8 @@ services:
     build: .
     container_name: eqemu_eqbcs
     environment:
-      EQBCS_SERVER_COUNT: 20
+      EQBCS_LOG_LEVEL: DEBUG
+      EQBCS_SERVER_COUNT: 5
       EQBCS_PORT_RANGE_START: 22112
     ports:
       - "22112-22131:22112-22131"   # maps 20 ports (22112..22131)
