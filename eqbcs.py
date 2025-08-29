@@ -754,10 +754,6 @@ def main() -> int:
   ap.add_argument("-l","--logfile", default=None)
   ap.add_argument("-v","--debug", action="store_true", help="enable verbose debug logging")
   ap.add_argument("-s","--password", default=None, help="require password; changes accepted login token to LOGIN:<password>=")
-  # compatibility flags (accepted but ignored): -t, -r, -d
-  ap.add_argument("-t","--trace", action="store_true", help="(compat) socket trace; use LOG_LEVEL=DEBUG instead")
-  ap.add_argument("-r","--no-rename", action="store_true", help="(compat) disable process renaming (no-op)")
-  ap.add_argument("-d","--daemonize", action="store_true", help="(compat) daemonize (no-op)")
 
   args = ap.parse_args()
 
@@ -766,7 +762,7 @@ def main() -> int:
     return 2
 
   # ENV overrides flags (for Docker Compose)
-  envLogLevel = _parseLogLevel(os.getenv("EQBCS_LOG_LEVEL") or os.getenv("LOG_LEVEL"))
+  envLogLevel = _parseLogLevel(os.getenv("EQBCS_LOG_LEVEL"))
   level = envLogLevel if envLogLevel is not None else (logging.DEBUG if args.debug else logging.INFO)
   logFile = os.getenv("EQBCS_LOG_FILE") or args.logfile
   password = os.getenv("EQBCS_PASSWORD") if os.getenv("EQBCS_PASSWORD") is not None else args.password
@@ -778,11 +774,12 @@ def main() -> int:
   # ---- config banner (proves env + effective level) ----
   lvlname = logging.getLevelName(level)
   _cfglog = logging.getLogger("eqbcs")
-  _cfglog.info("[config] level=%s(%s) env(EQBCS_LOG_LEVEL=%r LOG_LEVEL=%r) "
-               "toggles(RX_RAW=%s STATE=%s KEEPALIVE=%s CTRL_SUMMARY=%s CTRL_RECIPIENTS=%s) port=%s client_timeout=%ss (0=legacy no-disconnect)",
-               lvlname, level, os.getenv("EQBCS_LOG_LEVEL"), os.getenv("LOG_LEVEL"),
-               LOG_RX_RAW, LOG_STATE, LOG_KEEPALIVE, LOG_CTRL_SUMMARY, LOG_CTRL_RECIPIENTS,
-               args.port, CLIENT_TIMEOUT)
+  _cfglog.info("[config] level=%s(%s) EQBCS_LOG_LEVEL=%r port=%s "
+               "EQBCS_LOG_RX_RAW=%s EQBCS_LOG_STATE=%s EQBCS_LOG_KEEPALIVE=%s "
+               "EQBCS_LOG_CTRL_SUMMARY=%s EQBCS_LOG_CTRL_RECIPIENTS=%s) client_timeout=%ss",
+               lvlname, level, os.getenv("EQBCS_LOG_LEVEL"), args.port,
+               LOG_RX_RAW, LOG_STATE, LOG_KEEPALIVE, 
+               LOG_CTRL_SUMMARY, LOG_CTRL_RECIPIENTS, CLIENT_TIMEOUT)
 
   srv = EqbcsPyServer(args.bind, args.port, password=password)
   srv.start()
