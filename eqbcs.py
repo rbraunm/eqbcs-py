@@ -7,6 +7,8 @@ import socket
 import sys
 import time
 import signal
+import base64
+import secrets
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
 
@@ -17,12 +19,12 @@ loginStartToken = "LOGIN="
 
 # keepalive (matches legacy timing closely)
 pingSeconds = 30
-pingTimeoutSeconds = 75
+pingTimeoutSeconds = 75  # advisory-only per spec v0.1.3
 
 # message type bytes used by the legacy EQBCS wire protocol
 msgTypeNormal   = 1
 msgTypeNbmsg    = 2
-msgTypeMsgAll   = 3   # /bca, /bcaa -> broadcast command (forwarded as plain text)
+msgTypeMsgAll   = 3   # /bca, /bcaa -> broadcast command (as plain text wire)
 msgTypeTell     = 4
 msgTypeChannels = 5
 msgTypeBci      = 6
@@ -59,10 +61,14 @@ def _parseLogLevel(s: Optional[str]) -> Optional[int]:
       return n
   return None
 
-def setupLogger(logPath: Optional[str], level: int) -> None:
+def setupLogger(logPath: Optional[str], level: int, *, port_prefix: Optional[int] = None) -> None:
   logger.handlers.clear()
   logger.setLevel(level)
-  fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+  fmt_str = "%(asctime)s [%(levelname)s]"
+  if port_prefix is not None:
+    fmt_str += f" {port_prefix}"
+  fmt_str += " %(message)s"
+  fmt = logging.Formatter(fmt_str)
 
   ch = logging.StreamHandler(sys.stdout)
   ch.setLevel(level)
@@ -75,9 +81,140 @@ def setupLogger(logPath: Optional[str], level: int) -> None:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
+# env toggles
+def _env_bool(name: str, default: bool=False) -> bool:
+  v = os.getenv(name)
+  if v is None:
+    return default
+  return v.strip().lower() in ("1","true","yes","on")
+
+def _env_int(name: str, default: int) -> int:
+  v = os.getenv(name)
+  if v is None or v.strip() == "":
+    return default
+  try:
+    return max(0, int(v.strip()))
+  except Exception:
+    return default
+
+LOG_KEEPALIVE = _env_bool("EQBCS_LOG_KEEPALIVE", False)
+LOG_RX_RAW = _env_bool("EQBCS_LOG_RX_RAW", False)
+LOG_STATE = _env_bool("EQBCS_LOG_STATE", False)
+LOG_CTRL_SUMMARY = _env_bool("EQBCS_LOG_CTRL_SUMMARY", False)
+LOG_CTRL_RECIPIENTS = _env_bool("EQBCS_LOG_CTRL_RECIPIENTS", False)
+CLIENT_TIMEOUT = _env_int("EQBCS_CLIENT_TIMEOUT", 120)  # seconds; 0 disables disconnect (legacy)
+
+# -------- password policy helpers (master/instance; supports null/auto/defined) --------
+def _parse_pw_policy(raw: Optional[str]) -> Tuple[str, Optional[str]]:
+  """
+  Returns (mode, value):
+    mode: "none" | "auto" | "defined"
+    value: the password when mode == "defined", else None
+  Accepts None/""/"null"/"none" -> "none"
+  Accepts "auto" (case-insensitive) -> "auto"
+  Any other string -> "defined"
+  """
+  if raw is None:
+    return ("none", None)
+  t = raw.strip()
+  if t == "":
+    return ("none", None)
+  tl = t.lower()
+  if tl in ("null","none","unset","default"):
+    return ("none", None)
+  if tl == "auto":
+    return ("auto", None)
+  return ("defined", t)
+
+def _gen_base64_22() -> str:
+  # 16 random bytes -> base64 is 24 chars with '=='; strip padding to get 22
+  import os, base64
+  return base64.b64encode(os.urandom(16)).decode("ascii").rstrip("=")
+
+def resolve_instance_password(instance_no: int) -> Optional[str]:
+  """
+  Resolve the effective password for the given instance number based on:
+    EQBCS_MASTER_PASSWORD: null|auto|<string>
+    EQBCS_INSTANCEX_PASSWORD: null|auto|<string>  (X is instance_no)
+  Rules:
+    - Instance env missing or "null" -> inherit master behavior
+    - Master "null" -> no password
+    - "auto" -> generate once per scope, log it
+    - "defined" -> use provided string
+  """
+  master_raw = os.getenv("EQBCS_MASTER_PASSWORD")
+  inst_raw = os.getenv(f"EQBCS_INSTANCE{instance_no}_PASSWORD")
+  mMode, mValue = _parse_pw_policy(master_raw)
+  iMode, iValue = _parse_pw_policy(inst_raw)
+  # Cache for auto master so we reuse the same across instances
+  global _AUTO_MASTER_PASSWORD_CACHE
+  try:
+    _AUTO_MASTER_PASSWORD_CACHE
+  except NameError:
+    _AUTO_MASTER_PASSWORD_CACHE = None
+
+  def _master_effective() -> Optional[str]:
+    nonlocal mMode, mValue
+    global _AUTO_MASTER_PASSWORD_CACHE
+    if mMode == "none":
+      return None
+    if mMode == "defined":
+      return mValue
+    if mMode == "auto":
+      if _AUTO_MASTER_PASSWORD_CACHE is None:
+        _AUTO_MASTER_PASSWORD_CACHE = _gen_base64_22()
+        logger.info("[security] Generated master password (auto): %s", _AUTO_MASTER_PASSWORD_CACHE)
+      return _AUTO_MASTER_PASSWORD_CACHE
+    return None
+
+  # Instance policy
+  if iMode == "none":
+    # inherit master behavior
+    pw = _master_effective()
+    if pw is None:
+      logger.info("[security] No password required for instance %s (inherits master=null).", instance_no)
+    else:
+      # Do not log the actual master password here (already logged if auto)
+      logger.info("[security] Using master password for instance %s.", instance_no)
+    return pw
+
+  if iMode == "defined":
+    logger.info("[security] Using explicit password for instance %s.", instance_no)
+    return iValue
+
+  if iMode == "auto":
+    pw = _gen_base64_22()
+    logger.info("[security] Generated password for instance %s (auto): %s", instance_no, pw)
+    return pw
+
+  # Fallback safety
+  return _master_effective()
+
+
 # ---------------- helpers ----------------
 def nowSeconds() -> int:
   return int(time.time())
+
+def _preview(s: str, n: int = 200) -> str:
+  s = s.replace("\n", "\\n")
+  return s if len(s) <= n else s[:n] + "…"
+
+def _sendLine(sock: socket.socket, line: str) -> None:
+  payload = line.encode("utf-8", "ignore")
+  if not payload.endswith(b"\n"):
+    payload += b"\n"
+  sock.sendall(payload)
+
+def _sendTyped(sock: socket.socket, typeByte: int, text: str) -> None:
+  # Typed wire format used only for legacy NBPKT and some control lines; for
+  # MSGALL/TELL/BCI we intentionally send *plain text* lines per spec.
+  payload = bytearray()
+  payload.extend(b"\t")
+  payload.append(typeByte & 0xFF)
+  payload.extend(text.encode("utf-8", "ignore"))
+  if not payload.endswith(b"\n"):
+    payload.extend(b"\n")
+  sock.sendall(payload)
 
 def _split_name_payload(text: str) -> Tuple[str, str]:
   # For typed frames where text is "Name\tpayload"
@@ -86,9 +223,33 @@ def _split_name_payload(text: str) -> Tuple[str, str]:
     return a, b
   return text, ""
 
-def _preview(s: str, n: int = 200) -> str:
-  s = s.replace("\n", "\\n")
-  return s if len(s) <= n else s[:n] + "…"
+def _unescape_text(s: str) -> str:
+  # Backslash escapes the next character (TELL/BCI payloads)
+  out = []
+  i = 0
+  while i < len(s):
+    c = s[i]
+    if c == "\\" and i + 1 < len(s):
+      out.append(s[i+1])
+      i += 2
+    else:
+      out.append(c)
+      i += 1
+  return "".join(out)
+
+def _collapse_spaces(s: str) -> str:
+  # collapse multiple spaces to single (cosmetic; preserves tabs)
+  out = []
+  prev_space = False
+  for ch in s:
+    if ch == " ":
+      if not prev_space:
+        out.append(ch)
+      prev_space = True
+    else:
+      out.append(ch)
+      prev_space = False
+  return "".join(out)
 
 @dataclass
 class Client:
@@ -102,240 +263,345 @@ class Client:
   pendingMsgType: Optional[int] = None
   localEcho: bool = False
   chanList: str = ""  # space-separated channel tokens
-
-# ---------------- low-level TX ----------------
-def _sendLine(sock: socket.socket, text: str) -> None:
-  payload = text.encode("utf-8", "ignore")
-  if not payload.endswith(b"\n"):
-    payload += b"\n"
-  sock.sendall(payload)
-
-def _sendTyped(sock: socket.socket, typeByte: int, text: str) -> None:
-  payload = bytearray(b"\t")
-  payload.append(typeByte & 0xFF)
-  payload.extend(text.encode("utf-8", "ignore"))
-  if not payload.endswith(b"\n"):
-    payload.extend(b"\n")
-  sock.sendall(payload)
+  isClosing: bool = False  # reentrancy guard for disconnect
 
 # ---------------- server ----------------
 class EqbcsPyServer:
-  def __init__(self, bindAddr: str, port: int, *, logKeepalive: bool = False) -> None:
+  def __init__(self, bindAddr: str, port: int, *, password: Optional[str] = None, maxClients: int = 250) -> None:
     self.bindAddr = bindAddr
     self.port = port
     self.sel = selectors.DefaultSelector()
     self.clients: Dict[socket.socket, Client] = {}
     self._shouldStop = False
     self._lsock: Optional[socket.socket] = None
-    self.logKeepalive = logKeepalive  # NEW: gate keepalive logging
+    self.password = password
+    self.maxClients = maxClients
 
   # lifecycle
-  def request_stop(self, reason: str = "signal") -> None:
-    logger.info("Stopping EQBCS(py) on %s:%s (%s)", self.bindAddr, self.port, reason)
-    self._shouldStop = True
-    try:
-      if self._lsock:
-        try:
-          self.sel.unregister(self._lsock)
-        except Exception:
-          pass
-        self._lsock.close()
-        self._lsock = None
-    except Exception:
-      pass
-
   def start(self) -> None:
-    # socket setup
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    self._lsock = lsock
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     lsock.bind((self.bindAddr, self.port))
-    lsock.listen()
+    lsock.listen(1)  # spec backlog: 1
     lsock.setblocking(False)
+    self._lsock = lsock
     self.sel.register(lsock, selectors.EVENT_READ, data=None)
-
-    # single "Starting ..." line (avoid duplicates)
-    logger.info("Starting EQBCS(py) on %s:%s", self.bindAddr, self.port)
     logger.info("EQBCS(py) listening on %s:%s", self.bindAddr, self.port)
+
+    # graceful shutdown
+    signal.signal(signal.SIGINT, lambda *_: self._stop())
+    signal.signal(signal.SIGTERM, lambda *_: self._stop())
 
     try:
       while not self._shouldStop:
-        for key, mask in self.sel.select(timeout=1.0):
+        events = self.sel.select(timeout=1.0)
+        for key, mask in events:
           if key.data is None:
-            self._accept(key.fileobj)  # type: ignore[arg-type]
+            self._accept(key.fileobj)
           else:
             self._service(key, mask)
         self._tick()
-    except KeyboardInterrupt:
-      logger.info("KeyboardInterrupt received; shutting down...")
     finally:
       self._closeAll()
-      logger.info("EQBCS(py) stopped on %s:%s", self.bindAddr, self.port)
 
-  # sockets
+  def _stop(self) -> None:
+    self._shouldStop = True
+
+  # accept / service
   def _accept(self, lsock: socket.socket) -> None:
-    conn, addr = lsock.accept()
-    conn.setblocking(False)
+    try:
+      conn, addr = lsock.accept()
+      conn.setblocking(False)
+    except Exception as e:
+      logger.error("[accept] error: %s", e)
+      return
+
+    if len(self.clients) >= self.maxClients:
+      try:
+        _sendLine(conn, "-- Server full.")
+      except Exception:
+        pass
+      try:
+        conn.close()
+      finally:
+        return
+
     cli = Client(sock=conn, addr=addr)
     self.clients[conn] = cli
     self.sel.register(conn, selectors.EVENT_READ, data=cli)
-    logger.info("[conn] %s:%s connected (clients=%d)", addr[0], addr[1], self._clientCount())
+    logger.info("[conn] %s:%s connected (clients=%d)", addr[0], addr[1], len(self.clients))
 
-  def _service(self, key: selectors.SelectorKey, mask: int) -> None:
-    cli: Client = key.data  # type: ignore[assignment]
-    sock = cli.sock
-    try:
-      if mask & selectors.EVENT_READ:
-        data = sock.recv(4096)
-        if not data:
-          self._disconnect(cli, reason="EOF")
-          return
-        cli.readBuf.extend(data)
-        self._drainLines(cli)
-    except Exception as e:
-      self._disconnect(cli, reason=f"error: {e}")
-
-  def _drainLines(self, cli: Client) -> None:
-    while True:
-      nl = cli.readBuf.find(b"\n")
-      if nl < 0:
-        break
-      raw = cli.readBuf[:nl].rstrip(b"\r")
-      del cli.readBuf[: nl + 1]
+  def _service(self, key, mask) -> None:
+    cli: Client = key.data
+    if mask & selectors.EVENT_READ:
       try:
-        line = raw.decode("utf-8", "ignore")
+        data = cli.sock.recv(4096)
+      except ConnectionResetError:
+        self._disconnect(cli, reason="reset by peer")
+        return
+      if not data:
+        self._disconnect(cli, reason="eof")
+        return
+      cli.readBuf.extend(data)
+      # process full lines (split on \n). Preserve possible \t inside lines.
+      while True:
+        nl = cli.readBuf.find(b"\n")
+        if nl < 0:
+          break
+        raw = cli.readBuf[:nl].rstrip(b"\r")  # ignore CR in command lines per spec
+        del cli.readBuf[:nl+1]
+        try:
+          line = raw.decode("utf-8", "ignore")
+        except Exception:
+          line = ""
+        self._rx_line(cli, line)
+
+  # disconnect
+  def _disconnect(self, cli: Client, reason: str = "") -> None:
+    # Reentrancy-safe & remove-before-broadcast to avoid recursion
+    if cli.isClosing:
+      return
+    cli.isClosing = True
+    nm = cli.charName or f"{cli.addr[0]}:{cli.addr[1]}"
+    # Remove from I/O and client map first
+    try:
+      self.sel.unregister(cli.sock)
+    except Exception:
+      pass
+    try:
+      cli.sock.close()
+    except Exception:
+      pass
+    self.clients.pop(cli.sock, None)
+
+    # Now it's safe to log and notify others
+    logger.info("[disc] %s: %s", nm, reason)
+    if cli.authorized and cli.charName:
+      # NBQUIT to all others
+      self._broadcastControl(f"\tNBQUIT={cli.charName}")
+      # system line (human logs only)
+      self._broadcastSystem(f"-- {cli.charName} has left the server.")
+      # push updated roster
+      self._broadcastNbClientList()
+
+  def _closeAll(self) -> None:
+    if self._lsock:
+      try:
+        self.sel.unregister(self._lsock)
       except Exception:
-        line = ""
-      # Gate RX log for keepalive lines
-      is_keepalive = (line == "\tPONG") or (line == "") or (line == "\tPING")
-      if is_keepalive and not self.logKeepalive:
-        pass  # skip RX debug for keepalive chatter
-      else:
-        logger.debug("RX [%s] raw=%r line=%r", cli.charName or f"{cli.addr[0]}:{cli.addr[1]}", raw, line)
-      self._handleLine(cli, line, raw)
+        pass
+      try:
+        self._lsock.close()
+      except Exception:
+        pass
+    for cli in list(self.clients.values()):
+      self._disconnect(cli, reason="server shutdown")
 
-  # high-level line handling
-  def _handleLine(self, cli: Client, line: str, raw: bytes) -> None:
+  # inbound line handling
+  def _rx_line(self, cli: Client, line: str) -> None:
     if not cli.authorized:
-      if loginStartToken in line and ";" in line:
-        start = line.find(loginStartToken) + len(loginStartToken)
-        end = line.find(";", start)
-        cli.charName = line[start:end].strip()[:70]
-        cli.authorized = True
-        logger.info("[login] %s:%s -> %s", cli.addr[0], cli.addr[1], cli.charName)
-        self._tx_text(cli, f"-- {cli.charName} has joined the server.", kind="SYSTEM")
-        self._kickSameName(cli)
-      # allow LOCALECHO immediately on same login line for MQ2EQBC
-      if "LOCALECHO" in line.upper():
-        v = "1" if ("1" in line or line.upper().strip().endswith("LOCALECHO")) else "0"
-        cli.localEcho = (v == "1")
-        self._tx_text(cli, f"-- Local Echo: {'ON' if cli.localEcho else 'OFF'}", kind="SYSTEM")
+      self._handle_login_or_buffer(cli, line)
       return
 
-    # keepalive control
-    if line == "\tPONG":
-      cli.lastPongAt = nowSeconds()
-      if self.logKeepalive:
-        logger.debug("PONG from %s (lastPongAt=%d)", cli.charName or f"{cli.addr}", cli.lastPongAt)
-      return
-    if line == "\tPING":
-      # client shouldn’t send this, but don’t echo it either
+    # Command line?
+    if line.startswith("\t"):
+      self._handle_command(cli, line[1:].strip())
       return
 
-    # ignore empty lines (prevents blank chats on PONG processing)
+    # Blank line (often seen after PONG on some clients)
     if line == "":
-      if self.logKeepalive:
-        logger.debug("Ignored blank line from %s", cli.charName or f"{cli.addr}")
+      if LOG_KEEPALIVE:
+        logger.debug("Ignored blank line from %s", cli.charName or f"{cli.addr[0]}:{cli.addr[1]}")
       return
 
-    ucmd = line.strip().upper()
-
-    # simple commands
-    if ucmd.startswith("LOCALECHO"):
-      v = "1" if ("1" in ucmd or ucmd == "LOCALECHO") else "0"
-      cli.localEcho = (v == "1")
-      self._tx_text(cli, f"-- Local Echo: {'ON' if cli.localEcho else 'OFF'}", kind="SYSTEM")
-      return
-    if ucmd == "NAMES":
-      names: List[str] = [c.charName for c in self.clients.values() if c.authorized and c.charName]
-      self._tx_text(cli, "-- Names: " + (" ".join(sorted(names)) if names else "") + " .", kind="SYSTEM")
-      return
-    if ucmd == "NBNAMES":
-      names: List[str] = [c.charName for c in self.clients.values() if c.authorized and c.charName]
-      # legacy NBCLIENTLIST line (tab-prefixed)
-      self._tx_text(cli, "\tNBCLIENTLIST=" + " ".join(sorted(names)), kind="NBMSG")
-      return
-
-    # two-step typed commands
-    if ucmd in ("MSGALL", "NBMSG", "TELL", "CHANNELS", "BCI"):
-      cli.pendingMsgType = {
-        "MSGALL": msgTypeMsgAll,
-        "NBMSG": msgTypeNbmsg,
-        "TELL": msgTypeTell,
-        "CHANNELS": msgTypeChannels,
-        "BCI": msgTypeBci,
-      }[ucmd]
-      logger.debug("RX_TYPE preface from %s: pending=%d(%s)",
-                   cli.charName, cli.pendingMsgType, TYPE_NAMES.get(cli.pendingMsgType, "?"))
-      return
-
-    # treat unknown TAB-prefixed lines as control noise
-    if raw.startswith(b"\t") and cli.pendingMsgType is None:
-      logger.debug("Ignored unrecognized control line from %s: %r", cli.charName, raw)
-      return
-
-    # payload for pending type
+    # normal line
     if cli.pendingMsgType is not None:
       t = cli.pendingMsgType
       cli.pendingMsgType = None
-      payload = line  # keep original spacing
-      logger.debug("RX_TYPE payload from %s: type=%d(%s) payload=%r",
-                   cli.charName, t, TYPE_NAMES.get(t, "?"), payload)
-
-      if t == msgTypeMsgAll:
-        # IMPORTANT: legacy forwards MSGALL to recipients as *plain text* "<Name> payload"
-        self._broadcastMsgAll(cli, payload)
-        return
-
       if t == msgTypeNbmsg:
-        # Legacy NBMSG -> \tNBPKT:<name>:<payload>
-        self._broadcastNbpkt(cli, payload)
+        logger.debug("RX_TYPE payload from %s: type=%d(%s) payload=%r",
+                     cli.charName, t, TYPE_NAMES.get(t,"?"), _preview(line))
+        self._broadcastNbpkt(cli, line)
         return
-
+      if t == msgTypeMsgAll:
+        logger.debug("RX_TYPE payload from %s: type=%d(%s) payload=%r",
+                     cli.charName, t, TYPE_NAMES.get(t,"?"), _preview(line))
+        self._broadcastMsgAll(cli, line)
+        return
       if t == msgTypeTell:
-        if "\t" in payload:
-          target, msg = payload.split("\t", 1)
-        else:
-          parts = payload.split(" ", 1)
-          target, msg = (parts[0], parts[1] if len(parts) == 2 else "")
-        self._sendTell(cli, target.strip(), msg)
+        logger.debug("RX_TYPE payload from %s: type=%d(%s) payload=%r",
+                     cli.charName, t, TYPE_NAMES.get(t,"?"), _preview(line))
+        # <target> <text>
+        target, msg = (line.split(" ", 1) + [""])[:2]
+        self._routeTell(cli, target, _unescape_text(msg))
         return
-
       if t == msgTypeChannels:
-        cli.chanList = payload.strip()
+        logger.debug("RX_TYPE payload from %s: type=%d(%s) payload=%r",
+                     cli.charName, t, TYPE_NAMES.get(t,"?"), _preview(line))
+        cli.chanList = line.strip()
         announce = f"{cli.charName} joined channels {cli.chanList}."
         self._tx_text(cli, announce, kind="CHANNELS")
-        self._broadcastLocal(cli, announce)
+        # no broadcast; confirmation only to the caller per spec
         return
-
       if t == msgTypeBci:
-        self._handleBci(cli, payload)
+        logger.debug("RX_TYPE payload from %s: type=%d(%s) payload=%r",
+                     cli.charName, t, TYPE_NAMES.get(t,"?"), _preview(line))
+        # <target> <text>
+        target, msg = (line.split(" ", 1) + [""])[:2]
+        self._handleBci(cli, target, _unescape_text(msg))
         return
 
+      # Unknown pending -> ignore
       return
 
-    # untyped -> treat as MSGALL so plugins can parse consistently
+    # untyped -> treat as MSGALL
     logger.debug("Coercing untyped line to MSGALL from %s: %r", cli.charName, line)
     self._broadcastMsgAll(cli, line)
 
-  # ---------------- outbound helpers ----------------
+  # authentication & login parsing
+  def _handle_login_or_buffer(self, cli: Client, line: str) -> None:
+    # Expect LOGIN forms:
+    #   LOGIN=<CharName>;
+    #   LOGIN:<Password>=<CharName>;
+    if not line.startswith("LOGIN"):
+      # ignore anything until proper login
+      return
+
+    # carve off anything after the first ';' then process the remainder (e.g., "\tLOCALECHO 1")
+    if ";" in line:
+      loginPart, remainder = line.split(";", 1)
+    else:
+      loginPart, remainder = line, ""
+
+    name = ""
+    providedPassword: Optional[str] = None
+
+    if loginPart.startswith("LOGIN:"):
+      # With-password form: LOGIN:<password>=<name>
+      try:
+        after = loginPart[len("LOGIN:"):]
+        providedPassword, name = after.split("=", 1)
+      except ValueError:
+        name = ""
+    elif loginPart.startswith("LOGIN="):
+      name = loginPart[len("LOGIN="):]
+    else:
+      name = ""
+
+    name = name.strip()
+    if not name:
+      self._disconnect(cli, reason="empty login name")
+      return
+
+    if self.password is not None:
+      if providedPassword != self.password:
+        self._disconnect(cli, reason="bad password")
+        return
+
+    # store and authorize
+    cli.charName = name
+    cli.authorized = True
+    cli.lastPingAt = nowSeconds()
+    cli.lastPongAt = nowSeconds()
+    logger.info("[login] %s:%s -> %s", cli.addr[0], cli.addr[1], cli.charName)
+
+    # kick existing with same (case-insensitive per spec duplicate policy uses case-sensitive? spec clarifies CS for duplicates)
+    self._kickSameName(cli)
+
+    # control lines & roster
+    self._broadcastControl(f"\tNBJOIN={cli.charName}")
+    self._tx_control(cli, f"\tNBCLIENTLIST={self._roster_line()}")
+    self._broadcastSystem(f"-- {cli.charName} has joined the server.")
+    self._broadcastNbClientList()  # push roster to others as well
+
+    # If remainder contains additional commands (e.g., "\tLOCALECHO 1"), handle it
+    remainder = remainder.lstrip()
+    if remainder.startswith("\t"):
+      self._handle_command(cli, remainder[1:].strip())
+
+  # command dispatcher
+  def _handle_command(self, cli: Client, cmdLine: str) -> None:
+    # cmdLine already stripped and without leading TAB
+    if not cmdLine:
+      return
+    # token and args separated by a single space (spec)
+    parts = cmdLine.split(" ", 1)
+    token = parts[0].strip().upper()
+    arg = parts[1] if len(parts) == 2 else ""
+
+    if token == "PONG":
+      cli.lastPongAt = nowSeconds()
+      if LOG_KEEPALIVE:
+        logger.debug("PONG from %s (lastPongAt=%d)", cli.charName, cli.lastPongAt)
+      return
+    if token == "NAMES":
+      self._handleNames(cli)
+      return
+    if token == "NBNAMES":
+      self._tx_control(cli, f"\tNBCLIENTLIST={self._roster_line()}")
+      return
+    if token == "DISCONNECT":
+      self._disconnect(cli, reason="client requested disconnect")
+      return
+    if token == "LOCALECHO":
+      v = arg.strip()
+      newVal = (v == "1" or v.upper() in ("ON","TRUE"))
+      cli.localEcho = newVal
+      self._tx_text(cli, f"-- Local Echo: {'ON' if cli.localEcho else 'OFF'}", kind="LOCALECHO")
+      return
+
+    # arm-and-next-line commands
+    if token == "NBMSG":
+      cli.pendingMsgType = msgTypeNbmsg
+      logger.debug("RX_TYPE preface from %s: pending=%d(%s)", cli.charName, cli.pendingMsgType, TYPE_NAMES.get(cli.pendingMsgType,"?"))
+      return
+    if token == "MSGALL":
+      cli.pendingMsgType = msgTypeMsgAll
+      logger.debug("RX_TYPE preface from %s: pending=%d(%s)", cli.charName, cli.pendingMsgType, TYPE_NAMES.get(cli.pendingMsgType,"?"))
+      return
+    if token == "TELL":
+      cli.pendingMsgType = msgTypeTell
+      logger.debug("RX_TYPE preface from %s: pending=%d(%s)", cli.charName, cli.pendingMsgType, TYPE_NAMES.get(cli.pendingMsgType,"?"))
+      return
+    if token == "CHANNELS":
+      cli.pendingMsgType = msgTypeChannels
+      logger.debug("RX_TYPE preface from %s: pending=%d(%s)", cli.charName, cli.pendingMsgType, TYPE_NAMES.get(cli.pendingMsgType,"?"))
+      return
+    if token == "BCI":
+      cli.pendingMsgType = msgTypeBci
+      logger.debug("RX_TYPE preface from %s: pending=%d(%s)", cli.charName, cli.pendingMsgType, TYPE_NAMES.get(cli.pendingMsgType,"?"))
+      return
+
+    # unknown command
+    self._tx_text(cli, f"-- Unknown Command: {token}", kind="UNKNOWN")
+
+  # names
+  def _handleNames(self, cli: Client) -> None:
+    names = self._all_names_sorted()
+    self._tx_text(cli, f"-- Names: {' '.join(names)} .", kind="NAMES")
+
+  def _all_names_sorted(self) -> List[str]:
+    return sorted([c.charName for c in self.clients.values() if c.authorized and c.charName])
+
+  def _roster_line(self) -> str:
+    return " ".join(self._all_names_sorted())
+
+  # outbound helpers
   def _tx_text(self, dst: Client, text: str, *, kind: str = "TEXT") -> None:
     try:
       _sendLine(dst.sock, text)
-      # Gate keepalive TX logs
-      if not (kind == "PING" and not self.logKeepalive):
-        logger.debug("TX_TEXT(%s) -> [%s] %r",
-                     kind, dst.charName or f"{dst.addr[0]}:{dst.addr[1]}", _preview(text))
+      logger.debug("TX_TEXT(%s) -> [%s] %r",
+                   kind, dst.charName or f"{dst.addr[0]}:{dst.addr[1]}", _preview(text))
+    except Exception:
+      self._disconnect(dst, reason="send failure")
+
+  def _tx_control(self, dst: Client, text: str) -> None:
+    # control lines are emitted as-is; ensure newline
+    try:
+      _sendLine(dst.sock, text)
+      t_ctrl = text.strip("\r\n")
+      if not ((t_ctrl in ("\tPING", "\tPONG")) and not LOG_KEEPALIVE):
+        logger.debug("TX_CTRL -> [%s] %r", dst.charName or f"{dst.addr[0]}:{dst.addr[1]}", _preview(text))
     except Exception:
       self._disconnect(dst, reason="send failure")
 
@@ -349,16 +615,32 @@ class EqbcsPyServer:
       self._disconnect(dst, reason="send failure")
 
   # broadcast helpers
+  def _broadcastControl(self, line: str) -> None:
+    for dst in list(self.clients.values()):
+      if not dst.authorized:
+        continue
+      self._tx_control(dst, line)
+
   def _broadcastMsgAll(self, src: Client, msg: str) -> None:
-    # Legacy: forward as *plain* "<Name> payload" (not a typed frame)
-    line = f"<{src.charName}> {msg}"
+    body = _collapse_spaces(msg.strip())
+    # If it looks like /bca or /bcaa payload (starts with //), send per-recipient with their name.
+    if body.startswith("//"):
+      for dst in list(self.clients.values()):
+        if not dst.authorized:
+          continue
+        if dst is src and not src.localEcho:
+          continue
+        per = f"<{src.charName}> {dst.charName} {body}"
+        self._tx_text(dst, per, kind="MSGALL")
+      return
+    # Plain chat: no roster names.
+    line = f"<{src.charName}> {body}"
     for dst in list(self.clients.values()):
       if not dst.authorized:
         continue
       if dst is src and not src.localEcho:
         continue
       self._tx_text(dst, line, kind="MSGALL")
-
   def _broadcastNbpkt(self, src: Client, msg: str) -> None:
     # Legacy NBMSG format: "\tNBPKT:<name>:<payload>" (never echoed locally)
     line = f"\tNBPKT:{src.charName}:{msg}"
@@ -367,37 +649,17 @@ class EqbcsPyServer:
         continue
       if dst is src:
         continue
-      self._tx_text(dst, line, kind="NBMSG")
+      self._tx_control(dst, line)
 
-  def _sendTell(self, src: Client, target: str, msg: str) -> None:
-    # Legacy user-facing format: "[src] to [target]: msg"
+  def _routeTell(self, src: Client, target: str, msg: str) -> None:
+    if not target:
+      return
+    # Case-insensitive match on character names
     for dst in self.clients.values():
       if dst.authorized and dst.charName.lower() == target.lower():
-        self._tx_text(dst, f"[{src.charName}] to [{target}]: {msg}", kind="TELL")
+        self._tx_text(dst, f"[{src.charName}] {msg}", kind="TELL")
         return
-    self._tx_text(src, f"-- {target}: No such name.", kind="TELL")
-
-  def _handleBci(self, src: Client, payload: str) -> None:
-    """
-    BCI delivery:
-      - If first token is a name, deliver to that one.
-      - Else treat token as channel and deliver to all subscribers.
-    Recipients get '{name} payload' as a plain line (matches legacy user-facing text).
-    """
-    if not payload:
-      return
-    parts = payload.split(" ", 1)
-    token = parts[0]
-    msg = parts[1] if len(parts) == 2 else ""
-
-    # direct name
-    for dst in self.clients.values():
-      if dst.authorized and dst.charName.lower() == token.lower():
-        logger.debug("BCI direct -> [%s] from %s payload=%r", dst.charName, src.charName, msg)
-        self._tx_text(dst, f"{{{src.charName}}} {msg}", kind="BCI")
-        return
-
-    # channel delivery
+    # Else treat target as channel token, case-sensitive
     delivered = False
     for dst in self.clients.values():
       if not dst.authorized:
@@ -407,76 +669,97 @@ class EqbcsPyServer:
       if not dst.chanList:
         continue
       chans = set(dst.chanList.split())
-      if token in chans:
-        logger.debug("BCI channel '%s' -> [%s] from %s payload=%r", token, dst.charName, src.charName, msg)
+      if target in chans:
+        self._tx_text(dst, f"[{src.charName}] {msg}", kind="TELL")
+        delivered = True
+    if not delivered:
+      self._tx_text(src, f"-- {target}: No such name.", kind="TELL")
+
+  def _handleBci(self, src: Client, target: str, msg: str) -> None:
+    if not target:
+      return
+    # direct name (case-insensitive)
+    for dst in self.clients.values():
+      if dst.authorized and dst.charName.lower() == target.lower():
+        self._tx_text(dst, f"{{{src.charName}}} {msg}", kind="BCI")
+        return
+    # channel delivery (case-sensitive tokens)
+    delivered = False
+    for dst in self.clients.values():
+      if not dst.authorized:
+        continue
+      if dst is src and not src.localEcho:
+        continue
+      if not dst.chanList:
+        continue
+      chans = set(dst.chanList.split())
+      if target in chans:
         self._tx_text(dst, f"{{{src.charName}}} {msg}", kind="BCI")
         delivered = True
     if not delivered:
-      self._tx_text(src, f"-- {token}: No such name.", kind="BCI")
+      self._tx_text(src, f"-- {target}: No such name.", kind="BCI")
 
   def _broadcastLocal(self, src: Client, text: str) -> None:
     for dst in list(self.clients.values()):
       if not dst.authorized or dst is src:
         continue
-      self._tx_text(dst, text, kind="SYSTEM")
+      self._tx_text(dst, text, kind="LOCAL")
 
   def _broadcastSystem(self, text: str) -> None:
-    for dst in list(self.clients.values()):
-      if not dst.authorized:
-        continue
-      self._tx_text(dst, text, kind="SYSTEM")
+    # Log-only system line; do not send to clients (matches legacy behavior)
+    logger.info("[system] %s", text)
+  def _broadcastNbClientList(self) -> None:
+    line = f"\tNBCLIENTLIST={self._roster_line()}"
+    self._broadcastControl(line)
 
   def _kickSameName(self, newcomer: Client) -> None:
+    # Duplicate-login detection is case-sensitive according to 0.1.3 notes,
+    # but previous behavior kicked on case-insensitive match. Follow spec:
     for dst in list(self.clients.values()):
       if dst is newcomer or not dst.authorized:
         continue
-      if dst.charName and dst.charName.lower() == newcomer.charName.lower():
+      if dst.charName and dst.charName == newcomer.charName:
         self._disconnect(dst, reason="duplicate name (replaced by new connection)")
 
-  # timers / disconnect
+  # timers / keepalive
   def _tick(self) -> None:
     t = nowSeconds()
     for cli in list(self.clients.values()):
       if not cli.authorized:
         continue
+      # periodic PING
       if cli.lastPingAt + pingSeconds <= t:
-        self._tx_text(cli, "\tPING", kind="PING")  # TX log gated in _tx_text
+        self._tx_control(cli, "\tPING")
         cli.lastPingAt = t
-      if cli.lastPongAt + pingTimeoutSeconds <= t:
-        self._disconnect(cli, reason="pong timeout")
+        if LOG_KEEPALIVE:
+          logger.debug("TX keepalive PING -> %s", cli.charName)
+      # timeout handling
+      if CLIENT_TIMEOUT > 0:
+        if cli.lastPongAt + CLIENT_TIMEOUT <= t:
+          self._disconnect(cli, reason=f"timeout > {CLIENT_TIMEOUT}s without PONG")
+          continue
+      else:
+        # legacy advisory-only mode
+        if cli.lastPongAt + pingTimeoutSeconds <= t:
+          if LOG_KEEPALIVE:
+            logger.debug("PONG timeout (advisory) for %s (lastPongAt=%d, now=%d)", cli.charName, cli.lastPongAt, t)
+          # bump window so we don't spam logs
+          cli.lastPongAt = t
 
-  def _disconnect(self, cli: Client, reason: str = "") -> None:
-    try:
-      nm = cli.charName or f"{cli.addr[0]}:{cli.addr[1]}"
-      logger.info("[disc] %s: %s (clients=%d)", nm, reason, self._clientCount() - 1)
-      if cli.authorized and cli.charName:
-        self._broadcastSystem(f"-- {cli.charName} has left the server.")
-    finally:
-      try:
-        self.sel.unregister(cli.sock)
-      except Exception:
-        pass
-      try:
-        cli.sock.close()
-      except Exception:
-        pass
-      self.clients.pop(cli.sock, None)
-
-  def _closeAll(self) -> None:
-    for cli in list(self.clients.values()):
-      self._disconnect(cli, reason="server shutdown")
-
-  def _clientCount(self) -> int:
-    return sum(1 for c in self.clients.values() if c.authorized)
-
-# -------- CLI ----------------------------------------------------------------
+# ---------------- CLI ----------------
 def main() -> int:
-  parser = argparse.ArgumentParser(description="EQBCS-like server in Python")
-  parser.add_argument("-p", "--port", type=int, default=eqbcDefaultPort)
-  parser.add_argument("-i", "--bind", default="0.0.0.0")
-  parser.add_argument("-l", "--logfile", default=None)
-  parser.add_argument("-v", "--debug", action="store_true", help="enable verbose debug logging")
-  args = parser.parse_args()
+  ap = argparse.ArgumentParser(description="EQBCS-like server in Python")
+  ap.add_argument("-p","--port", type=int, default=eqbcDefaultPort)
+  ap.add_argument("-i","--bind", default="0.0.0.0")
+  ap.add_argument("-l","--logfile", default=None)
+  ap.add_argument("-v","--debug", action="store_true", help="enable verbose debug logging")
+  ap.add_argument("-s","--password", default=None, help="require password; changes accepted login token to LOGIN:<password>=")
+  # compatibility flags (accepted but ignored): -t, -r, -d
+  ap.add_argument("-t","--trace", action="store_true", help="(compat) socket trace; use LOG_LEVEL=DEBUG instead")
+  ap.add_argument("-r","--no-rename", action="store_true", help="(compat) disable process renaming (no-op)")
+  ap.add_argument("-d","--daemonize", action="store_true", help="(compat) daemonize (no-op)")
+
+  args = ap.parse_args()
 
   if not (0 < args.port <= maxPortSize):
     print(f"Invalid port: {args.port}", file=sys.stderr)
@@ -486,22 +769,22 @@ def main() -> int:
   envLogLevel = _parseLogLevel(os.getenv("EQBCS_LOG_LEVEL") or os.getenv("LOG_LEVEL"))
   level = envLogLevel if envLogLevel is not None else (logging.DEBUG if args.debug else logging.INFO)
   logFile = os.getenv("EQBCS_LOG_FILE") or args.logfile
-  # NEW: keepalive logging gate (default off)
-  logKeepalive = (os.getenv("EQBCS_LOG_KEEPALIVE", "").strip().lower() in ("1","true","yes","on"))
+  password = os.getenv("EQBCS_PASSWORD") if os.getenv("EQBCS_PASSWORD") is not None else args.password
 
-  setupLogger(logFile, level)
+  # Logger prefix = port from CLI only (no env vars)
+  setupLogger(logFile, level, port_prefix=args.port)
+  logger.info("Starting EQBCS(py) on %s:%s", args.bind, args.port)
+  
+  # ---- config banner (proves env + effective level) ----
+  lvlname = logging.getLevelName(level)
+  _cfglog = logging.getLogger("eqbcs")
+  _cfglog.info("[config] level=%s(%s) env(EQBCS_LOG_LEVEL=%r LOG_LEVEL=%r) "
+               "toggles(RX_RAW=%s STATE=%s KEEPALIVE=%s CTRL_SUMMARY=%s CTRL_RECIPIENTS=%s) port=%s client_timeout=%ss (0=legacy no-disconnect)",
+               lvlname, level, os.getenv("EQBCS_LOG_LEVEL"), os.getenv("LOG_LEVEL"),
+               LOG_RX_RAW, LOG_STATE, LOG_KEEPALIVE, LOG_CTRL_SUMMARY, LOG_CTRL_RECIPIENTS,
+               args.port, CLIENT_TIMEOUT)
 
-  srv = EqbcsPyServer(args.bind, args.port, logKeepalive=logKeepalive)
-
-  # allow SIGTERM/SIGINT to stop cleanly (useful in containers)
-  def _stop(signum, frame):
-    srv.request_stop(reason=f"signal {signum}")
-  try:
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
-  except Exception:
-    pass
-
+  srv = EqbcsPyServer(args.bind, args.port, password=password)
   srv.start()
   return 0
 
