@@ -14,14 +14,16 @@ The repo ships with a ready‑to‑use `docker-compose.yml` that can launch **N*
 2. (Optional) Edit `docker-compose.yml` environment values to your liking (see [Environment variables](#environment-variables)).
 3. Bring it up:
    ```bash
-   docker compose up -d```
+   docker compose up -d
+   ```
 4. MQ clients can connect to any of the exposed ports (e.g., `22112`–`22116` by default).
 
 > **Heads‑up on port mapping:** The `ports:` stanza maps a *range*, and **must** match `EQBCS_PY_PORT_RANGE_START` and `EQBCS_PY_SERVER_COUNT`. Example mapping from the included compose file:
 >
 > ```yaml
 > ports:
->   - "22112-22116:22112-22116"```
+>   - "22112-22116:22112-22116"
+> ```
 > With `EQBCS_PY_PORT_RANGE_START=22112` and `EQBCS_PY_SERVER_COUNT=5`, that exposes instances on 22112..22116.
 
 #### One‑shot overrides
