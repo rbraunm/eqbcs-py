@@ -1,19 +1,18 @@
 services:
   eqbcs:
     build: .
-    container_name: eqemu_eqbcs
+    container_name: eqemu_eqbcs_py
     environment:
-      EQBCS_SERVER_COUNT: 5
-      EQBCS_PORT_RANGE_START: 22112
-      EQBCS_LOG_LEVEL: INFO
-      EQBCS_LOG_CTRL_SUMMARY: 0
-      EQBCS_LOG_CTRL_RECIPIENTS: 0
-      EQBCS_LOG_STATE: 0
-      EQBCS_LOG_RX_RAW: 0
-      EQBCS_LOG_KEEPALIVE: 0
+      EQBCS_PY_SERVER_COUNT: 5
+      EQBCS_PY_PORT_RANGE_START: 22112
+      EQBCS_PY_LOG_LEVEL: INFO
+      EQBCS_PY_LOG_CTRL_SUMMARY: 0
+      EQBCS_PY_LOG_CTRL_RECIPIENTS: 0
+      EQBCS_PY_LOG_STATE: 0
+      EQBCS_PY_LOG_RX_RAW: 0
+      EQBCS_PY_LOG_KEEPALIVE: 0
     ports:
-      - "22112-22131:22112-22131"   # maps 20 ports (22112..22131)
-    #restart: unless-stopped
-    restart: no
+      - "22112-22116:22112-22116" # Port range must start with EQBCS_PY_PORT_RANGE_START and end with EQBCS_PY_PORT_RANGE_START + EQBCS_PY_SERVER_COUNT - 1
+    restart: unless-stopped
     stop_signal: SIGTERM
     stop_grace_period: 10s

@@ -8,7 +8,6 @@ import sys
 import time
 import signal
 import base64
-import secrets
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
 
@@ -39,7 +38,7 @@ TYPE_NAMES = {
 }
 
 # ---------------- centralized logger (env-driven) ----------------
-logger = logging.getLogger("eqbcs")
+logger = logging.getLogger("eqbcs-py")
 
 def _parseLogLevel(s: Optional[str]) -> Optional[int]:
   if not s:
@@ -97,12 +96,12 @@ def _env_int(name: str, default: int) -> int:
   except Exception:
     return default
 
-LOG_KEEPALIVE = _env_bool("EQBCS_LOG_KEEPALIVE", False)
-LOG_RX_RAW = _env_bool("EQBCS_LOG_RX_RAW", False)
-LOG_STATE = _env_bool("EQBCS_LOG_STATE", False)
-LOG_CTRL_SUMMARY = _env_bool("EQBCS_LOG_CTRL_SUMMARY", False)
-LOG_CTRL_RECIPIENTS = _env_bool("EQBCS_LOG_CTRL_RECIPIENTS", False)
-CLIENT_TIMEOUT = _env_int("EQBCS_CLIENT_TIMEOUT", 120)  # seconds; 0 disables disconnect (legacy)
+LOG_KEEPALIVE = _env_bool("EQBCS_PY_LOG_KEEPALIVE", False)
+LOG_RX_RAW = _env_bool("EQBCS_PY_LOG_RX_RAW", False)
+LOG_STATE = _env_bool("EQBCS_PY_LOG_STATE", False)
+LOG_CTRL_SUMMARY = _env_bool("EQBCS_PY_LOG_CTRL_SUMMARY", False)
+LOG_CTRL_RECIPIENTS = _env_bool("EQBCS_PY_LOG_CTRL_RECIPIENTS", False)
+CLIENT_TIMEOUT = _env_int("EQBCS_PY_CLIENT_TIMEOUT", 120)  # seconds; 0 disables disconnect (legacy)
 
 # -------- password policy helpers (master/instance; supports null/auto/defined) --------
 def _parse_pw_policy(raw: Optional[str]) -> Tuple[str, Optional[str]]:
@@ -120,30 +119,29 @@ def _parse_pw_policy(raw: Optional[str]) -> Tuple[str, Optional[str]]:
   if t == "":
     return ("none", None)
   tl = t.lower()
-  if tl in ("null","none","unset","default"):
+  # treat common falsy toggles as "none" (in addition to null/none/unset/default)
+  if tl in ("null","none","unset","default","false","0","off","no"):
     return ("none", None)
   if tl == "auto":
     return ("auto", None)
   return ("defined", t)
 
 def _gen_base64_22() -> str:
-  # 16 random bytes -> base64 is 24 chars with '=='; strip padding to get 22
-  import os, base64
   return base64.b64encode(os.urandom(16)).decode("ascii").rstrip("=")
 
 def resolve_instance_password(instance_no: int) -> Optional[str]:
   """
   Resolve the effective password for the given instance number based on:
-    EQBCS_MASTER_PASSWORD: null|auto|<string>
-    EQBCS_INSTANCEX_PASSWORD: null|auto|<string>  (X is instance_no)
+    EQBCS_PY_MASTER_PASSWORD: null|auto|<string>
+    EQBCS_PY_INSTANCEX_PASSWORD: null|auto|<string>  (X is instance_no)
   Rules:
-    - Instance env missing or "null" -> inherit master behavior
-    - Master "null" -> no password
+    - Instance env missing or "none" -> inherit master behavior
+    - Master "none" -> no password
     - "auto" -> generate once per scope, log it
     - "defined" -> use provided string
   """
-  master_raw = os.getenv("EQBCS_MASTER_PASSWORD")
-  inst_raw = os.getenv(f"EQBCS_INSTANCE{instance_no}_PASSWORD")
+  master_raw = os.getenv("EQBCS_PY_MASTER_PASSWORD")
+  inst_raw = os.getenv(f"EQBCS_PY_INSTANCE{instance_no}_PASSWORD")
   mMode, mValue = _parse_pw_policy(master_raw)
   iMode, iValue = _parse_pw_policy(inst_raw)
   # Cache for auto master so we reuse the same across instances
@@ -172,7 +170,7 @@ def resolve_instance_password(instance_no: int) -> Optional[str]:
     # inherit master behavior
     pw = _master_effective()
     if pw is None:
-      logger.info("[security] No password required for instance %s (inherits master=null).", instance_no)
+      logger.info("[security] No password required for instance %s (inherits master=none).", instance_no)
     else:
       # Do not log the actual master password here (already logged if auto)
       logger.info("[security] Using master password for instance %s.", instance_no)
@@ -762,10 +760,9 @@ def main() -> int:
     return 2
 
   # ENV overrides flags (for Docker Compose)
-  envLogLevel = _parseLogLevel(os.getenv("EQBCS_LOG_LEVEL"))
+  envLogLevel = _parseLogLevel(os.getenv("EQBCS_PY_LOG_LEVEL"))
   level = envLogLevel if envLogLevel is not None else (logging.DEBUG if args.debug else logging.INFO)
-  logFile = os.getenv("EQBCS_LOG_FILE") or args.logfile
-  password = os.getenv("EQBCS_PASSWORD") if os.getenv("EQBCS_PASSWORD") is not None else args.password
+  logFile = os.getenv("EQBCS_PY_LOG_FILE") or args.logfile
 
   # Logger prefix = port from CLI only (no env vars)
   setupLogger(logFile, level, port_prefix=args.port)
@@ -773,15 +770,29 @@ def main() -> int:
   
   # ---- config banner (proves env + effective level) ----
   lvlname = logging.getLevelName(level)
-  _cfglog = logging.getLogger("eqbcs")
-  _cfglog.info("[config] level=%s(%s) EQBCS_LOG_LEVEL=%r port=%s "
-               "EQBCS_LOG_RX_RAW=%s EQBCS_LOG_STATE=%s EQBCS_LOG_KEEPALIVE=%s "
-               "EQBCS_LOG_CTRL_SUMMARY=%s EQBCS_LOG_CTRL_RECIPIENTS=%s) client_timeout=%ss",
-               lvlname, level, os.getenv("EQBCS_LOG_LEVEL"), args.port,
+  _cfglog = logging.getLogger("eqbcs-py")
+  _cfglog.debug("[config] level=%s(%s) EQBCS_PY_LOG_LEVEL=%r port=%s "
+               "EQBCS_PY_LOG_RX_RAW=%s EQBCS_PY_LOG_STATE=%s EQBCS_PY_LOG_KEEPALIVE=%s "
+               "EQBCS_PY_LOG_CTRL_SUMMARY=%s EQBCS_PY_LOG_CTRL_RECIPIENTS=%s client_timeout=%ss",
+               lvlname, level, os.getenv("EQBCS_PY_LOG_LEVEL"), args.port,
                LOG_RX_RAW, LOG_STATE, LOG_KEEPALIVE, 
                LOG_CTRL_SUMMARY, LOG_CTRL_RECIPIENTS, CLIENT_TIMEOUT)
 
-  srv = EqbcsPyServer(args.bind, args.port, password=password)
+  # ----- password resolution (per-instance -> master -> none, then CLI fallback) -----
+  try:
+    pr_start = int(os.getenv("EQBCS_PY_PORT_RANGE_START", str(args.port)))
+  except Exception:
+    pr_start = args.port
+  instance_no = args.port - pr_start
+  if instance_no < 0:
+    instance_no = 0
+
+  env_password = resolve_instance_password(instance_no)
+  if env_password is None and args.password:
+    logger.info("[security] Using explicit CLI password for instance %s.", instance_no)
+  effective_password = env_password if env_password is not None else (args.password or None)
+
+  srv = EqbcsPyServer(args.bind, args.port, password=effective_password)
   srv.start()
   return 0
 
