@@ -462,7 +462,11 @@ class EqbcsPyServer:
     #   LOGIN=<CharName>;
     #   LOGIN:<Password>=<CharName>;
     if not line.startswith("LOGIN"):
-      # ignore anything until proper login
+      # not logged in; if this looks like activity from a client that thinks it's connected,
+      # proactively tell it to reconnect and close the socket.
+      if line.startswith("\t"):
+        self._handle_orphan_activity(cli, line)
+      # otherwise ignore until proper login
       return
 
     # carve off anything after the first ';' then process the remainder (e.g., "\tLOCALECHO 1")
@@ -611,6 +615,33 @@ class EqbcsPyServer:
                    typeByte, TYPE_NAMES.get(typeByte, "?"), _preview(text))
     except Exception:
       self._disconnect(dst, reason="send failure")
+
+  def _handle_orphan_activity(self, cli: Client, line: str) -> None:
+    """
+    Input came from a socket that isn't authorized yet, but it's sending
+    keepalives or commands as if it were connected. Let the client know
+    and drop the connection so it can reconnect cleanly.
+    """
+    guessed_name = ""
+    try:
+      # Typed frames: "\t<typeByte><Name>\t<payload>"
+      if line.startswith("\t") and len(line) >= 2:
+        b = ord(line[1])
+        if 1 <= b <= 6 and len(line) > 2:
+          name_part = line[2:]
+          if "\t" in name_part:
+            guessed_name = name_part.split("\t", 1)[0].strip()
+    except Exception:
+      pass
+
+    nm = guessed_name or (cli.charName if getattr(cli, "charName", "") else f"{cli.addr[0]}:{cli.addr[1]}")
+    prev = _preview(line)
+    logger.info("[orphan] activity from %s while unauthenticated: %s", nm, prev)
+    try:
+      self._tx_control(cli, "\tDISCONNECT")
+      self._tx_text(cli, "-- Orphaned session: server is not tracking your login. Please reconnect.", kind="ORPHAN")
+    finally:
+      self._disconnect(cli, reason="orphan activity (sent DISCONNECT)")
 
   # broadcast helpers
   def _broadcastControl(self, line: str) -> None:
