@@ -1,5 +1,5 @@
 # EQBCS‑PY
-MacroQuest‑compatible **EQBCS** server reimplemented in Python, with multi‑instance support, Docker/Compose packaging, and an optional VS Code‑driven deploy workflow.
+MacroQuest‑compatible **EQBCS** server reimplemented in Python, with multi‑instance support, Docker/Compose packaging, and a deploy script for peridot.
 
 Wire‑compatible with the EQBCS protocol used by MacroQuest plugins. Point your MQ clients at the host:port you expose here and (optionally) a password; no client changes required.
 
@@ -39,36 +39,16 @@ You can override any env just for a run:
 
 ---
 
-### B) VS Code deploy flow (optional “dev‑toolchain as deploy”)
-The repo includes `.vscode/deploy.py`, an **interactive** SSH deploy helper that:
-- Stores connection profiles in your OS keyring
-- Rsync‑style uploads the repo to your server (excludes dotfolders and build junk)
-- Runs `docker compose down` then `docker compose build && docker compose up -d` remotely
+### B) Deploy to peridot
+`.vscode/deploy.py` deploys this repo to `/opt/eqemu/eqbcs` on peridot, where the live servers run, without prompting:
+- logs in as Claude's account (`claude`) with the SSH key stored in Windows Credential Manager under `claude/peridot.strata.unseencolor.com`, and refuses a host key that is not in `~/.ssh/known_hosts`
+- uploads the repo (without dot folders, `README.md`, `buildspec.yaml`, or the workspace file) to `~/.eqbcs-deploy`, then replaces `/opt/eqemu/eqbcs` with it as root, owned by `eqemu`
+- as `eqemu`, builds the image first, then runs `docker compose down` and `docker compose up -d`, so a failed build leaves the running servers alone
 
-**Run it directly**
 ```bash
 python .vscode/deploy.py
 ```
-It will prompt once for a profile (host, port, user, `~/remotePath`, and either a key file or password), then remember it. You can choose a profile name via `DEPLOY_PROFILE` (defaults to the current folder name).
-
-**Run from VS Code Tasks (if you wire one)**
-If you prefer Tasks, add a simple task that invokes the script:
-```jsonc
-// .vscode/tasks.json
-{
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "Deploy: Upload & Compose up",
-      "type": "shell",
-      "command": "python .vscode/deploy.py",
-      "group": "none",
-      "problemMatcher": []
-    }
-  ]
-}
-```
-Then `⇧⌘P` / `Ctrl+Shift+P` → **Tasks: Run Task** → *Deploy: Upload & Compose up*.
+or run the **Deploy** task from `.vscode/eqbcs-py.code-workspace`.
 
 ---
 
