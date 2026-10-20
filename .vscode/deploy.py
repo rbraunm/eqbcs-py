@@ -1,5 +1,3 @@
-import ctypes
-import ctypes.wintypes as wintypes
 import datetime
 import io
 import os
@@ -23,9 +21,12 @@ ensure("paramiko")
 
 import paramiko
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "mcps", "facet", "python"))
+from facetClient.secretStore import readLogin
+
 sshHost = "peridot.strata.unseencolor.com"
 sshUser = "claude"
-credentialTarget = f"claude/{sshHost}"
+credentialTarget = "hosts/peridot/claude"
 stagingPath = ".eqbcs-deploy"
 appOwner = "eqemu"
 appPath = "/opt/eqemu/eqbcs"
@@ -34,33 +35,6 @@ repositoryRoot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 skipNames = {"README.md", "buildspec.yaml"}
 skipSuffixes = (".code-workspace",)
 skipDirs = {"node_modules", "__pycache__", "dist", "build", "venv", ".venv"}
-
-class credentialRecord(ctypes.Structure):
-  _fields_ = [
-    ("Flags", wintypes.DWORD),
-    ("Type", wintypes.DWORD),
-    ("TargetName", wintypes.LPWSTR),
-    ("Comment", wintypes.LPWSTR),
-    ("LastWritten", wintypes.FILETIME),
-    ("CredentialBlobSize", wintypes.DWORD),
-    ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
-    ("Persist", wintypes.DWORD),
-    ("AttributeCount", wintypes.DWORD),
-    ("Attributes", ctypes.c_void_p),
-    ("TargetAlias", wintypes.LPWSTR),
-    ("UserName", wintypes.LPWSTR),
-  ]
-
-def readCredential(targetName):
-  advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-  pointer = ctypes.POINTER(credentialRecord)()
-  if not advapi32.CredReadW(targetName, 1, 0, ctypes.byref(pointer)):
-    sys.exit(f"No {targetName} in Windows Credential Manager (error {ctypes.get_last_error()}).")
-  try:
-    record = pointer.contents
-    return record.UserName, ctypes.string_at(record.CredentialBlob, record.CredentialBlobSize).decode("utf-16-le")
-  finally:
-    advapi32.CredFree(pointer)
 
 def run(ssh, command):
   stdin, stdout, stderr = ssh.exec_command(command)
@@ -78,7 +52,7 @@ def run(ssh, command):
 def isDeployed(fileName):
   return fileName not in skipNames and not fileName.endswith(skipSuffixes)
 
-userName, privateKey = readCredential(credentialTarget)
+userName, privateKey = readLogin(credentialTarget)
 if userName != sshUser:
   sys.exit(f"{credentialTarget} is for {userName}, not {sshUser}.")
 
